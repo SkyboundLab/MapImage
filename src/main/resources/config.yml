@@ -1,1 +1,12 @@
+# XP levels it costs to create an image map (0 = free)
+xp-cost-levels: 5
+
+# Require players to hold an empty map (the vanilla "Map" item) to create an image map.
+# One empty map is consumed when the map is created successfully.
+require-empty-map: true
+
+# Seconds a player has to type the image URL in chat after running /mapimage with no
+# arguments (fallback for clients/servers without dialog popup support).
+chat-input-timeout-seconds: 30
+
 maps: {}
