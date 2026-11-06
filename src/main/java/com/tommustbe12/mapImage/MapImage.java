@@ -59,6 +59,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
 
     private int xpCostLevels;
     private boolean requireEmptyMap;
+    private int maxMaps;
 
     private static final int TILE_SIZE = 128;
     private static final int MAX_DIMENSION = 512;
@@ -76,6 +77,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
 
         xpCostLevels = Math.max(0, config.getInt("xp-cost-levels", 5));
         requireEmptyMap = config.getBoolean("require-empty-map", true);
+        maxMaps = Math.max(1, config.getInt("max-maps", 64));
 
         getServer().getPluginManager().registerEvents(this, this);
 
@@ -154,16 +156,17 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
             rows = Integer.parseInt(parts[0]);
             cols = Integer.parseInt(parts[1]);
         }
+        if (!isValidSize(player, rows, cols)) return true;
 
         if (args.length < 1) {
             // User-friendly flow: hold an empty map, run /mapimage with no arguments,
             // then enter the image URL in the dialog popup (or in chat as a fallback).
-            if (!canCreateNow(player)) return true;
+            if (!canCreateNow(player, rows, cols)) return true;
             startUrlInput(player);
             return true;
         }
 
-        if (!canCreateNow(player)) return true;
+        if (!canCreateNow(player, rows, cols)) return true;
 
         startImageProcessing(args[0], rows, cols, player);
         return true;
@@ -200,7 +203,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                     .base(DialogBase.builder(Component.text("Create Image Map", NamedTextColor.GOLD))
                             .body(List.of(
                                     DialogBody.plainMessage(Component.text("Paste an image URL below and click Create.", NamedTextColor.GRAY)),
-                                    DialogBody.plainMessage(Component.text("Cost: " + xpCostLevels + " XP level(s) + 1 empty map", NamedTextColor.YELLOW))
+                                    DialogBody.plainMessage(Component.text("Cost: " + xpCostLevels + " XP level(s) + 1 empty map per tile (2x2 = 4 maps, max " + maxMaps + ")", NamedTextColor.YELLOW))
                             ))
                             .inputs(List.of(
                                     DialogInput.text("url", Component.text("Image URL", NamedTextColor.AQUA))
@@ -212,7 +215,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                     .type(DialogType.confirmation(
                             ActionButton.create(
                                     Component.text("Create Map", NamedTextColor.GREEN),
-                                    Component.text("Create the image map (" + xpCostLevels + " levels + 1 empty map)"),
+                                    Component.text("Create the image map (" + xpCostLevels + " levels + 1 empty map per tile)"),
                                     150,
                                     DialogAction.customClick((view, audience) -> {
                                         if (!(audience instanceof Player p)) return;
@@ -284,19 +287,44 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
             rows = Integer.parseInt(parts[0]);
             cols = Integer.parseInt(parts[1]);
         }
+        if (!isValidSize(player, rows, cols)) return;
 
-        if (!canCreateNow(player)) return;
+        if (!canCreateNow(player, rows, cols)) return;
         startImageProcessing(input, rows, cols, player);
     }
 
     /**
-     * Up-front check (main thread): the player must hold an empty map and have enough XP.
-     * The actual map/XP are only consumed once the image has loaded successfully.
+     * Validates a requested grid size: each side must be at least 1 and the total
+     * number of maps (rows * cols) may not exceed the configured max (default 64).
      */
-    private boolean canCreateNow(Player player) {
-        if (requireEmptyMap && !isHoldingEmptyMap(player)) {
-            player.sendMessage(ChatColor.RED + "Hold an empty map in your hand to create an image map.");
+    private boolean isValidSize(Player player, int rows, int cols) {
+        int mapsNeeded = rows * cols;
+        if (rows < 1 || cols < 1 || mapsNeeded > maxMaps) {
+            player.sendMessage(ChatColor.RED + "Invalid size " + rows + "x" + cols + " (" + mapsNeeded
+                    + " maps). Maximum is " + maxMaps + " maps (e.g. 8x8).");
             return false;
+        }
+        return true;
+    }
+
+    /**
+     * Up-front check (main thread): the player must hold an empty map, have enough
+     * empty maps for the whole grid, and have enough XP. The actual maps/XP are only
+     * consumed once the image has loaded successfully.
+     */
+    private boolean canCreateNow(Player player, int rows, int cols) {
+        int mapsNeeded = rows * cols;
+        if (requireEmptyMap) {
+            if (!isHoldingEmptyMap(player)) {
+                player.sendMessage(ChatColor.RED + "Hold an empty map in your hand to create an image map.");
+                return false;
+            }
+            int available = countEmptyMaps(player);
+            if (available < mapsNeeded) {
+                player.sendMessage(ChatColor.RED + "A " + rows + "x" + cols + " image needs " + mapsNeeded
+                        + " empty maps, but you only have " + available + ".");
+                return false;
+            }
         }
         if (xpCostLevels > 0 && player.getLevel() < xpCostLevels) {
             player.sendMessage(ChatColor.RED + "Creating an image map costs " + xpCostLevels
@@ -316,15 +344,16 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
     }
 
     /**
-     * Consumes one empty map and the XP cost on the main thread, right before the
-     * maps are created. Returns false (and charges nothing) if the player no longer
-     * has what they need.
+     * Consumes the required number of empty maps (one per tile, e.g. 4 for 2x2) and the
+     * XP cost on the main thread, right before the maps are created. Returns false (and
+     * charges nothing) if the player no longer has what they need.
      */
-    private boolean commitCosts(Player player) {
+    private boolean commitCosts(Player player, int mapsNeeded) {
         if (!player.isOnline()) return false;
 
-        if (requireEmptyMap && !consumeEmptyMap(player)) {
-            player.sendMessage(ChatColor.RED + "You no longer have an empty map. Creation cancelled, nothing was charged.");
+        if (requireEmptyMap && !consumeEmptyMaps(player, mapsNeeded)) {
+            player.sendMessage(ChatColor.RED + "You no longer have " + mapsNeeded
+                    + " empty map(s). Creation cancelled, nothing was charged.");
             return false;
         }
 
@@ -340,26 +369,52 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return true;
     }
 
-    private boolean consumeEmptyMap(Player player) {
+    private int countEmptyMaps(Player player) {
+        int count = 0;
         PlayerInventory inv = player.getInventory();
-        ItemStack main = inv.getItemInMainHand();
-        if (isEmptyMap(main)) {
-            main.setAmount(main.getAmount() - 1);
-            return true;
-        }
-        ItemStack off = inv.getItemInOffHand();
-        if (isEmptyMap(off)) {
-            off.setAmount(off.getAmount() - 1);
-            return true;
-        }
-        for (int i = 0; i < inv.getSize(); i++) {
-            ItemStack item = inv.getItem(i);
-            if (isEmptyMap(item)) {
-                item.setAmount(item.getAmount() - 1);
-                return true;
+        for (ItemStack item : inv.getStorageContents()) count += isEmptyMap(item) ? item.getAmount() : 0;
+        for (ItemStack item : inv.getArmorContents()) count += isEmptyMap(item) ? item.getAmount() : 0;
+        for (ItemStack item : inv.getExtraContents()) count += isEmptyMap(item) ? item.getAmount() : 0;
+        return count;
+    }
+
+    /**
+     * Removes {@code count} empty maps, preferring the hand (main, then off) before the
+     * rest of the inventory. Returns false if the player doesn't have enough.
+     */
+    private boolean consumeEmptyMaps(Player player, int count) {
+        if (countEmptyMaps(player) < count) return false;
+
+        PlayerInventory inv = player.getInventory();
+        int remaining = takeFrom(inv.getItemInMainHand(), count);
+        if (remaining > 0) remaining = takeFrom(inv.getItemInOffHand(), remaining);
+        if (remaining > 0) {
+            for (ItemStack item : inv.getStorageContents()) {
+                remaining = takeFrom(item, remaining);
+                if (remaining <= 0) break;
             }
         }
-        return false;
+        if (remaining > 0) {
+            for (ItemStack item : inv.getArmorContents()) {
+                remaining = takeFrom(item, remaining);
+                if (remaining <= 0) break;
+            }
+        }
+        if (remaining > 0) {
+            for (ItemStack item : inv.getExtraContents()) {
+                remaining = takeFrom(item, remaining);
+                if (remaining <= 0) break;
+            }
+        }
+        return remaining <= 0;
+    }
+
+    /** Removes up to {@code count} from the given stack, returning how many were not taken. */
+    private int takeFrom(ItemStack item, int count) {
+        if (!isEmptyMap(item)) return count;
+        int take = Math.min(count, item.getAmount());
+        item.setAmount(item.getAmount() - take);
+        return count - take;
     }
 
     private void startImageProcessing(String input, int rows, int cols, Player player) {
@@ -436,10 +491,10 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         }
         scaled.flush();
 
-        // Charge the empty map + XP once, on the main thread, right before the maps are created.
-        // If the charge fails, no maps are created and nothing is lost.
+        // Charge the empty maps (one per tile) + XP once, on the main thread, right before
+        // the maps are created. If the charge fails, no maps are created and nothing is lost.
         mapQueue.add(() -> {
-            if (!commitCosts(player)) return;
+            if (!commitCosts(player, finalRows * finalCols)) return;
             for (Tile tile : tiles) {
                 final Tile t = tile;
                 mapQueue.add(() -> createMapOnMainThread(
