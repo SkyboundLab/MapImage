@@ -24,6 +24,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.server.MapInitializeEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.MapMeta;
@@ -42,12 +43,15 @@ import java.net.URL;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
 public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
@@ -64,6 +68,29 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
     private static final int TILE_SIZE = 128;
     private static final int MAX_DIMENSION = 512;
     private static final int MAPS_PER_TICK = 2;
+
+    // --- Restart persistence: the rendered palette bytes are saved in config
+    // (Base64) so a restart never needs the network. Entries without saved
+    // pixels are migrated once (download -> extract -> persist) and then
+    // behave like saved ones.
+    private static final int PIXEL_COUNT = TILE_SIZE * TILE_SIZE;
+    private static final int MAX_DOWNLOAD_ATTEMPTS = 3;
+    private static final long DOWNLOAD_RETRY_DELAY_TICKS = 60L; // 3s
+    private static final int MAX_COLOR_CACHE_RETRIES = 10;
+    private static final long COLOR_CACHE_RETRY_DELAY_TICKS = 100L; // 5s; cold cache build takes ~39s
+    private static final int MAX_APPLY_RETRIES = 12;
+    private static final long APPLY_RETRY_DELAY_TICKS = 100L; // 5s; ~60s total
+
+    // Bookkeeping for one restore run (enable, or /mapimage repair).
+    private final AtomicInteger pendingRestore = new AtomicInteger();
+    private final AtomicInteger restoredFromPixels = new AtomicInteger();
+    private final AtomicInteger migratedFromDownload = new AtomicInteger();
+    private final AtomicInteger restoreFailed = new AtomicInteger();
+    private final Set<Integer> countedIds = ConcurrentHashMap.newKeySet();
+    private final Map<Integer, Integer> mapRun = new ConcurrentHashMap<>();
+    private volatile int currentRun = 0;
+    private volatile boolean restoreSummarySent = true;
+    private volatile Player restoreNotifyPlayer = null;
 
     private static final List<String> IMAGE_EXTENSIONS = Arrays.asList(
             ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"
@@ -97,40 +124,8 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
             }
         }, 1L, 1L);
 
-        if (config.isConfigurationSection("maps")) {
-            ConfigurationSection section = config.getConfigurationSection("maps");
-            if (section != null) {
-                for (String key : section.getKeys(false)) {
-                    try {
-                        int mapId = Integer.parseInt(key);
-                        ConfigurationSection entry = section.getConfigurationSection(key);
-                        if (entry == null) continue;
-
-                        String source = entry.getString("source", "url");
-                        int row = entry.getInt("row");
-                        int col = entry.getInt("col");
-                        int totalRows = entry.getInt("totalRows", 1);
-                        int totalCols = entry.getInt("totalCols", 1);
-
-                        if ("local".equals(source)) {
-                            String fileName = entry.getString("file");
-                            if (fileName != null) {
-                                int finalMapId = mapId;
-                                mapQueue.add(() -> reRenderMapFromFile(finalMapId, fileName, row, col, totalRows, totalCols));
-                            }
-                        } else {
-                            String url = entry.getString("url");
-                            if (url != null) {
-                                int finalMapId = mapId;
-                                mapQueue.add(() -> reRenderMapAsync(finalMapId, url, row, col, totalRows, totalCols));
-                            }
-                        }
-
-                    } catch (NumberFormatException ignored) {
-                    }
-                }
-            }
-        }
+        beginRestoreRun(null);
+        restoreSavedMaps();
     }
 
     @Override
@@ -147,6 +142,11 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
 
         if (!player.isOp() && !player.hasPermission("mapimage.use")) {
             player.sendMessage(ChatColor.RED + "You don't have permission to use this command.");
+            return true;
+        }
+
+        if (args.length >= 1 && args[0].equalsIgnoreCase("repair")) {
+            runRepair(player);
             return true;
         }
 
@@ -533,6 +533,9 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
             entry.set("col", col);
             entry.set("totalRows", totalRows);
             entry.set("totalCols", totalCols);
+            // Persist the rendered palette bytes themselves, so a restart can
+            // restore this map without any download (and without MapPalette).
+            entry.set("pixels", Base64.getEncoder().encodeToString(pixels));
             saveConfig();
 
             giver.getInventory().addItem(createMapItem(mapView));
@@ -542,39 +545,347 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         }
     }
 
-    private void reRenderMapAsync(int mapId, String url, int row, int col, int totalRows, int totalCols) {
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-            try (InputStream in = new URL(url).openStream()) {
-                BufferedImage original = ImageIO.read(in);
-                if (original == null) return;
+    // ------------------------------------------------------------------
+    // Restart restore: saved pixels first, one-shot migration for legacy
+    // URL/local entries that have no saved pixels yet.
+    // ------------------------------------------------------------------
 
-                byte[] pixels = extractTilePixels(original, row, col, totalRows, totalCols);
+    /** Starts a restore run (at enable, or from /mapimage repair). */
+    private void beginRestoreRun(Player notifyPlayer) {
+        currentRun++;
+        countedIds.clear();
+        mapRun.clear();
+        pendingRestore.set(0);
+        restoredFromPixels.set(0);
+        migratedFromDownload.set(0);
+        restoreFailed.set(0);
+        restoreSummarySent = false;
+        restoreNotifyPlayer = notifyPlayer;
+        // Safety net: if some tile never reaches a terminal state, still
+        // report what happened instead of staying silent forever.
+        final int run = currentRun;
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (run == currentRun) finishRestoreSummary(true);
+        }, 2400L); // 2 minutes
+    }
 
-                mapQueue.add(() -> applyRendererToExistingMap(mapId, pixels));
-            } catch (Exception e) {
-                getLogger().log(Level.WARNING, "Failed to re-download map image: " + url, e);
+    /**
+     * Queues the restore of every map in config. Maps with saved pixels are
+     * restored from those pixels on the main thread (no download, no
+     * MapPalette, so no color-cache race). Maps without pixels are migrated
+     * once: download -> extract -> persist pixels -> apply. Returns how many
+     * maps were queued.
+     */
+    private int restoreSavedMaps() {
+        if (!config.isConfigurationSection("maps")) return 0;
+        ConfigurationSection section = config.getConfigurationSection("maps");
+        if (section == null) return 0;
+
+        int fromPixels = 0;
+        int toMigrate = 0;
+        for (String key : section.getKeys(false)) {
+            int mapId;
+            try {
+                mapId = Integer.parseInt(key);
+            } catch (NumberFormatException ignored) {
+                continue;
             }
+            ConfigurationSection entry = section.getConfigurationSection(key);
+            if (entry == null) continue;
+
+            byte[] pixels = decodePixels(entry.getString("pixels"));
+            if (pixels != null) {
+                mapRun.put(mapId, currentRun);
+                pendingRestore.incrementAndGet();
+                final int id = mapId;
+                final byte[] p = pixels;
+                mapQueue.add(() -> applyWithRetry(id, p, true, 0));
+                fromPixels++;
+                continue;
+            }
+
+            String source = entry.getString("source", "url");
+            int row = entry.getInt("row");
+            int col = entry.getInt("col");
+            int totalRows = entry.getInt("totalRows", 1);
+            int totalCols = entry.getInt("totalCols", 1);
+            final int id = mapId;
+            if ("local".equals(source)) {
+                String fileName = entry.getString("file");
+                if (fileName == null) {
+                    getLogger().warning("MapImage: map " + mapId + " has no file and no saved pixels; skipping");
+                    continue;
+                }
+                mapRun.put(mapId, currentRun);
+                pendingRestore.incrementAndGet();
+                mapQueue.add(() -> migrateMapAsync(id, "local", null, fileName, row, col, totalRows, totalCols, 1));
+            } else {
+                String url = entry.getString("url");
+                if (url == null) {
+                    getLogger().warning("MapImage: map " + mapId + " has no URL and no saved pixels; skipping");
+                    continue;
+                }
+                mapRun.put(mapId, currentRun);
+                pendingRestore.incrementAndGet();
+                mapQueue.add(() -> migrateMapAsync(id, "url", url, null, row, col, totalRows, totalCols, 1));
+            }
+            toMigrate++;
+        }
+
+        getLogger().info("MapImage: restoring " + (fromPixels + toMigrate) + " saved map(s): "
+                + fromPixels + " from saved pixels, " + toMigrate + " need migration (download once, then persist)");
+        return fromPixels + toMigrate;
+    }
+
+    /** Decodes a saved pixel blob, or null if it is missing/invalid. */
+    private static byte[] decodePixels(String base64) {
+        if (base64 == null || base64.isBlank()) return null;
+        try {
+            byte[] pixels = Base64.getDecoder().decode(base64);
+            return pixels.length == PIXEL_COUNT ? pixels : null;
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private boolean hasPersistentRenderer(MapView view) {
+        for (MapRenderer renderer : view.getRenderers()) {
+            if (renderer instanceof PersistentRenderer) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Tries to (re-)attach the image renderer to an existing map. Returns
+     * true if the map now shows the image (or already did). Uses the int
+     * overload of Bukkit.getMap: the short overload truncates ids > 32767.
+     */
+    private boolean tryApplyRenderer(int mapId, byte[] pixels) {
+        MapView mapView;
+        try {
+            mapView = Bukkit.getMap(mapId);
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "MapImage: failed to look up map " + mapId, t);
+            return false;
+        }
+        if (mapView == null) return false;
+        if (hasPersistentRenderer(mapView)) return true;
+        mapView.getRenderers().forEach(mapView::removeRenderer);
+        mapView.addRenderer(new PersistentRenderer(pixels));
+        try {
+            mapView.setUnlimitedTracking(true);
+            mapView.setTrackingPosition(false);
+        } catch (Throwable ignored) {}
+        return true;
+    }
+
+    /** Applies a renderer, retrying while the map data is not loaded yet. */
+    private void applyWithRetry(int mapId, byte[] pixels, boolean fromPixels, int attempt) {
+        if (tryApplyRenderer(mapId, pixels)) {
+            if (fromPixels) {
+                getLogger().info("MapImage: restored map " + mapId + " from saved pixels");
+            } else {
+                getLogger().info("MapImage: migrated map " + mapId + " (downloaded once, pixels now saved)");
+            }
+            finishMap(mapId, fromPixels, true);
+            return;
+        }
+        if (attempt >= MAX_APPLY_RETRIES) {
+            getLogger().warning("MapImage: map " + mapId + " still not loaded after ~60s; "
+                    + "will retry when the map initializes or on the next restart");
+            finishMap(mapId, fromPixels, false);
+            return;
+        }
+        if (attempt == 0) {
+            getLogger().info("MapImage: map " + mapId + " not loaded yet, will retry");
+        }
+        final int next = attempt + 1;
+        Bukkit.getScheduler().runTaskLater(this,
+                () -> mapQueue.add(() -> applyWithRetry(mapId, pixels, fromPixels, next)),
+                APPLY_RETRY_DELAY_TICKS);
+    }
+
+    /**
+     * One-shot migration for a legacy URL/local entry with no saved pixels:
+     * downloads the image, then queues the (serialized, main-thread) pixel
+     * extraction. Download failures are retried; a tile that still fails is
+     * left un-restored and retried on the next restart, never silently lost.
+     */
+    private void migrateMapAsync(int mapId, String source, String url, String fileName,
+                                 int row, int col, int totalRows, int totalCols, int attempt) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            BufferedImage original = null;
+            Exception failure = null;
+            try {
+                if ("local".equals(source)) {
+                    File imageFile = resolveLocalFile(fileName);
+                    if (imageFile == null) {
+                        getLogger().warning("MapImage: cannot migrate map " + mapId
+                                + ": local file not found: " + fileName);
+                        finishMap(mapId, false, false);
+                        return;
+                    }
+                    original = ImageIO.read(imageFile);
+                    if (original == null) {
+                        getLogger().warning("MapImage: cannot migrate map " + mapId
+                                + ": could not read local file: " + fileName);
+                        finishMap(mapId, false, false);
+                        return;
+                    }
+                } else {
+                    getLogger().info("MapImage: migrating map " + mapId + ": downloading " + url);
+                    try (InputStream in = new URL(url).openStream()) {
+                        original = ImageIO.read(in);
+                    }
+                    if (original == null) {
+                        getLogger().warning("MapImage: cannot migrate map " + mapId
+                                + ": downloaded data is not a readable image: " + url);
+                        finishMap(mapId, false, false);
+                        return;
+                    }
+                }
+            } catch (Exception e) {
+                failure = e;
+            }
+            if (failure != null) {
+                if (attempt < MAX_DOWNLOAD_ATTEMPTS) {
+                    getLogger().warning("MapImage: failed to download map " + mapId
+                            + " (attempt " + attempt + "/" + MAX_DOWNLOAD_ATTEMPTS + "): "
+                            + failure + " -- retrying");
+                    final int next = attempt + 1;
+                    Bukkit.getScheduler().runTaskLater(this,
+                            () -> mapQueue.add(() -> migrateMapAsync(mapId, source, url, fileName, row, col, totalRows, totalCols, next)),
+                            DOWNLOAD_RETRY_DELAY_TICKS);
+                } else {
+                    getLogger().warning("MapImage: failed to download map " + mapId + " from " + url
+                            + " after " + MAX_DOWNLOAD_ATTEMPTS + " attempts: " + failure
+                            + " -- will retry on the next restart");
+                    finishMap(mapId, false, false);
+                }
+                return;
+            }
+
+            // Pixels are extracted on the main thread, serialized through
+            // mapQueue, so concurrent MapPalette.matchColor calls can never
+            // race the color-cache init (cold cache build takes ~39s; the
+            // first call throws IllegalStateException until it is ready).
+            final BufferedImage image = original;
+            mapQueue.add(() -> extractAndPersistTile(mapId, row, col, totalRows, totalCols, image, 0));
         });
     }
 
-    private void reRenderMapFromFile(int mapId, String fileName, int row, int col, int totalRows, int totalCols) {
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-            File imageFile = resolveLocalFile(fileName);
-            if (imageFile == null) {
-                getLogger().warning("Cannot re-render map " + mapId + ": local file not found: " + fileName);
+    /** Extracts one tile's pixels (main thread), persists them, then applies. */
+    private void extractAndPersistTile(int mapId, int row, int col, int totalRows, int totalCols,
+                                       BufferedImage original, int attempt) {
+        byte[] pixels;
+        try {
+            pixels = extractTilePixels(original, row, col, totalRows, totalCols);
+        } catch (IllegalStateException e) {
+            // Map color cache still building (cold start). Retry with a delay
+            // instead of dropping the tile.
+            if (attempt < MAX_COLOR_CACHE_RETRIES) {
+                if (attempt == 0) {
+                    getLogger().info("MapImage: map color cache not ready yet for map " + mapId
+                            + ", will retry (cold cache build takes a while)");
+                }
+                final int next = attempt + 1;
+                Bukkit.getScheduler().runTaskLater(this,
+                        () -> mapQueue.add(() -> extractAndPersistTile(mapId, row, col, totalRows, totalCols, original, next)),
+                        COLOR_CACHE_RETRY_DELAY_TICKS);
                 return;
             }
-            try {
-                BufferedImage original = ImageIO.read(imageFile);
-                if (original == null) return;
+            getLogger().log(Level.SEVERE, "MapImage: map color cache still not ready after "
+                    + MAX_COLOR_CACHE_RETRIES + " retries for map " + mapId
+                    + " -- will retry on the next restart", e);
+            finishMap(mapId, false, false);
+            return;
+        } catch (Throwable t) {
+            getLogger().log(Level.SEVERE, "MapImage: failed to render map " + mapId, t);
+            finishMap(mapId, false, false);
+            return;
+        }
 
-                byte[] pixels = extractTilePixels(original, row, col, totalRows, totalCols);
+        ConfigurationSection entry = config.getConfigurationSection("maps." + mapId);
+        if (entry == null) entry = config.createSection("maps." + mapId);
+        entry.set("pixels", Base64.getEncoder().encodeToString(pixels));
+        saveConfig();
 
-                mapQueue.add(() -> applyRendererToExistingMap(mapId, pixels));
-            } catch (Exception e) {
-                getLogger().log(Level.WARNING, "Failed to re-render map " + mapId + " from file: " + fileName, e);
-            }
-        });
+        applyWithRetry(mapId, pixels, false, 0);
+    }
+
+    /** Terminal accounting for one map in the current restore run. */
+    private void finishMap(int mapId, boolean fromPixels, boolean success) {
+        Integer run = mapRun.get(mapId);
+        if (run == null || run != currentRun) return;
+        if (!countedIds.add(mapId)) return;
+        if (success) {
+            if (fromPixels) restoredFromPixels.incrementAndGet();
+            else migratedFromDownload.incrementAndGet();
+        } else {
+            restoreFailed.incrementAndGet();
+        }
+        pendingRestore.decrementAndGet();
+        maybeFinishRestoreSummary();
+    }
+
+    private void maybeFinishRestoreSummary() {
+        if (restoreSummarySent) return;
+        if (pendingRestore.get() > 0) return;
+        finishRestoreSummary(false);
+    }
+
+    private void finishRestoreSummary(boolean forced) {
+        if (restoreSummarySent) return;
+        restoreSummarySent = true;
+        int pending = pendingRestore.get();
+        String msg = "MapImage: restore finished: " + restoredFromPixels.get() + " restored from saved pixels, "
+                + migratedFromDownload.get() + " migrated (downloaded + pixels saved), "
+                + restoreFailed.get() + " failed"
+                + (pending > 0 ? " (" + pending + " still pending)" : "")
+                + (forced && pending > 0 ? " -- some tiles are still retrying; they will finish or retry on the next restart" : "");
+        getLogger().info(msg);
+        Player player = restoreNotifyPlayer;
+        if (player != null && player.isOnline()) {
+            player.sendMessage(ChatColor.GREEN + msg.substring("MapImage: ".length()));
+        }
+        restoreNotifyPlayer = null;
+    }
+
+    /**
+     * Safety net for maps that load after enable (or whose enable-time
+     * restore ran before the map data was loaded): when a known map
+     * initializes, re-attach its saved image renderer.
+     */
+    @EventHandler
+    public void onMapInitialize(MapInitializeEvent event) {
+        MapView view = event.getMap();
+        int mapId = view.getId();
+        ConfigurationSection entry = config == null ? null : config.getConfigurationSection("maps." + mapId);
+        if (entry == null) return;
+        byte[] pixels = decodePixels(entry.getString("pixels"));
+        if (pixels == null) return;
+        if (hasPersistentRenderer(view)) return;
+        view.getRenderers().forEach(view::removeRenderer);
+        view.addRenderer(new PersistentRenderer(pixels));
+        try {
+            view.setUnlimitedTracking(true);
+            view.setTrackingPosition(false);
+        } catch (Throwable ignored) {}
+        getLogger().info("MapImage: re-applied saved image to map " + mapId + " as it initialized");
+    }
+
+    /** /mapimage repair: re-run the enable restore now, and report the result. */
+    private void runRepair(Player player) {
+        beginRestoreRun(player);
+        int queued = restoreSavedMaps();
+        if (queued == 0) {
+            player.sendMessage(ChatColor.YELLOW + "No image maps saved in config.yml to repair.");
+            finishRestoreSummary(false);
+            return;
+        }
+        player.sendMessage(ChatColor.GREEN + "Repair started for " + queued + " map(s): "
+                + "restoring from saved pixels or re-downloading missing ones. "
+                + "I'll report the result when it finishes.");
     }
 
     private byte[] extractTilePixels(BufferedImage original, int row, int col, int totalRows, int totalCols) {
@@ -598,17 +909,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         tile.flush();
         scaled.flush();
         return pixels;
-    }
-
-    private void applyRendererToExistingMap(int mapId, byte[] pixels) {
-        try {
-            MapView mapView = Bukkit.getMap((short) mapId);
-            if (mapView == null) return;
-            mapView.getRenderers().forEach(mapView::removeRenderer);
-            mapView.addRenderer(new PersistentRenderer(pixels));
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "Failed to re-render map " + mapId, t);
-        }
     }
 
     private File resolveLocalFile(String name) {
