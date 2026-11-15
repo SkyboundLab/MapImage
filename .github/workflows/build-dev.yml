@@ -27,10 +27,11 @@ jobs:
         run: echo "NAME=$(basename ${{ github.repository }})" >> $GITHUB_ENV
 
       - name: Upload Build
-        uses: marvinpinto/action-automatic-releases@master
+        uses: Twint-Studio/automatic-release@main
         with:
           title: "${{ env.NAME }}"
-          automatic_release_tag: "latest"
+          tag: "latest"
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
           files: "target/mapimage-*.jar"
           prerelease: false
+          generate_release_notes: false

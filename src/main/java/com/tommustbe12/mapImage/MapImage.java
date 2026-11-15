@@ -69,19 +69,14 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
     private static final int MAX_DIMENSION = 512;
     private static final int MAPS_PER_TICK = 2;
 
-    // --- Restart persistence: the rendered palette bytes are saved in config
-    // (Base64) so a restart never needs the network. Entries without saved
-    // pixels are migrated once (download -> extract -> persist) and then
-    // behave like saved ones.
     private static final int PIXEL_COUNT = TILE_SIZE * TILE_SIZE;
     private static final int MAX_DOWNLOAD_ATTEMPTS = 3;
-    private static final long DOWNLOAD_RETRY_DELAY_TICKS = 60L; // 3s
+    private static final long DOWNLOAD_RETRY_DELAY_TICKS = 60L;
     private static final int MAX_COLOR_CACHE_RETRIES = 10;
-    private static final long COLOR_CACHE_RETRY_DELAY_TICKS = 100L; // 5s; cold cache build takes ~39s
+    private static final long COLOR_CACHE_RETRY_DELAY_TICKS = 100L; // cold cache build takes ~39s
     private static final int MAX_APPLY_RETRIES = 12;
-    private static final long APPLY_RETRY_DELAY_TICKS = 100L; // 5s; ~60s total
+    private static final long APPLY_RETRY_DELAY_TICKS = 100L;
 
-    // Bookkeeping for one restore run (enable, or /mapimage repair).
     private final AtomicInteger pendingRestore = new AtomicInteger();
     private final AtomicInteger restoredFromPixels = new AtomicInteger();
     private final AtomicInteger migratedFromDownload = new AtomicInteger();
@@ -159,8 +154,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         if (!isValidSize(player, rows, cols)) return true;
 
         if (args.length < 1) {
-            // User-friendly flow: hold an empty map, run /mapimage with no arguments,
-            // then enter the image URL in the dialog popup (or in chat as a fallback).
             if (!canCreateNow(player, rows, cols)) return true;
             startUrlInput(player);
             return true;
@@ -172,10 +165,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return true;
     }
 
-    /**
-     * Starts the interactive URL input: shows a dialog popup (Minecraft 1.21.6+)
-     * and also listens for the URL in chat as a fallback for older clients.
-     */
     private void startUrlInput(Player player) {
         long timeoutSeconds = Math.max(1L, config.getLong("chat-input-timeout-seconds", 30L));
         long expiry = System.currentTimeMillis() + timeoutSeconds * 1000L;
@@ -193,10 +182,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         showUrlDialog(player);
     }
 
-    /**
-     * Shows a dialog popup with a text field for the image URL and an optional size field.
-     * Requires a Paper server with the Dialog API (1.21.7+); falls back to chat input otherwise.
-     */
     private void showUrlDialog(Player player) {
         try {
             Dialog dialog = Dialog.create(builder -> builder.empty()
@@ -237,15 +222,10 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                     )));
             player.showDialog(dialog);
         } catch (Throwable t) {
-            // Server/client too old for the Dialog API - the chat input fallback is already active.
             getLogger().log(Level.WARNING, "Could not show dialog popup (requires Paper 1.21.7+ / client 1.21.6+); using chat input instead", t);
         }
     }
 
-    /**
-     * Fallback for clients/servers without dialog support: the next chat message
-     * from a player who ran /mapimage with no arguments is used as the image URL.
-     */
     @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerChat(AsyncChatEvent event) {
         Player player = event.getPlayer();
@@ -293,10 +273,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         startImageProcessing(input, rows, cols, player);
     }
 
-    /**
-     * Validates a requested grid size: each side must be at least 1 and the total
-     * number of maps (rows * cols) may not exceed the configured max (default 64).
-     */
     private boolean isValidSize(Player player, int rows, int cols) {
         int mapsNeeded = rows * cols;
         if (rows < 1 || cols < 1 || mapsNeeded > maxMaps) {
@@ -307,11 +283,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return true;
     }
 
-    /**
-     * Up-front check (main thread): the player must hold an empty map, have enough
-     * empty maps for the whole grid, and have enough XP. The actual maps/XP are only
-     * consumed once the image has loaded successfully.
-     */
     private boolean canCreateNow(Player player, int rows, int cols) {
         int mapsNeeded = rows * cols;
         if (requireEmptyMap) {
@@ -343,11 +314,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return item != null && item.getType() == Material.MAP;
     }
 
-    /**
-     * Consumes the required number of empty maps (one per tile, e.g. 4 for 2x2) and the
-     * XP cost on the main thread, right before the maps are created. Returns false (and
-     * charges nothing) if the player no longer has what they need.
-     */
     private boolean commitCosts(Player player, int mapsNeeded) {
         if (!player.isOnline()) return false;
 
@@ -378,10 +344,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return count;
     }
 
-    /**
-     * Removes {@code count} empty maps, preferring the hand (main, then off) before the
-     * rest of the inventory. Returns false if the player doesn't have enough.
-     */
     private boolean consumeEmptyMaps(Player player, int count) {
         if (countEmptyMaps(player) < count) return false;
 
@@ -409,7 +371,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return remaining <= 0;
     }
 
-    /** Removes up to {@code count} from the given stack, returning how many were not taken. */
     private int takeFrom(ItemStack item, int count) {
         if (!isEmptyMap(item)) return count;
         int take = Math.min(count, item.getAmount());
@@ -491,8 +452,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         }
         scaled.flush();
 
-        // Charge the empty maps (one per tile) + XP once, on the main thread, right before
-        // the maps are created. If the charge fails, no maps are created and nothing is lost.
         mapQueue.add(() -> {
             if (!commitCosts(player, finalRows * finalCols)) return;
             for (Tile tile : tiles) {
@@ -533,8 +492,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
             entry.set("col", col);
             entry.set("totalRows", totalRows);
             entry.set("totalCols", totalCols);
-            // Persist the rendered palette bytes themselves, so a restart can
-            // restore this map without any download (and without MapPalette).
             entry.set("pixels", Base64.getEncoder().encodeToString(pixels));
             saveConfig();
 
@@ -545,12 +502,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Restart restore: saved pixels first, one-shot migration for legacy
-    // URL/local entries that have no saved pixels yet.
-    // ------------------------------------------------------------------
-
-    /** Starts a restore run (at enable, or from /mapimage repair). */
     private void beginRestoreRun(Player notifyPlayer) {
         currentRun++;
         countedIds.clear();
@@ -561,21 +512,12 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         restoreFailed.set(0);
         restoreSummarySent = false;
         restoreNotifyPlayer = notifyPlayer;
-        // Safety net: if some tile never reaches a terminal state, still
-        // report what happened instead of staying silent forever.
         final int run = currentRun;
         Bukkit.getScheduler().runTaskLater(this, () -> {
             if (run == currentRun) finishRestoreSummary(true);
-        }, 2400L); // 2 minutes
+        }, 2400L);
     }
 
-    /**
-     * Queues the restore of every map in config. Maps with saved pixels are
-     * restored from those pixels on the main thread (no download, no
-     * MapPalette, so no color-cache race). Maps without pixels are migrated
-     * once: download -> extract -> persist pixels -> apply. Returns how many
-     * maps were queued.
-     */
     private int restoreSavedMaps() {
         if (!config.isConfigurationSection("maps")) return 0;
         ConfigurationSection section = config.getConfigurationSection("maps");
@@ -637,7 +579,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return fromPixels + toMigrate;
     }
 
-    /** Decodes a saved pixel blob, or null if it is missing/invalid. */
     private static byte[] decodePixels(String base64) {
         if (base64 == null || base64.isBlank()) return null;
         try {
@@ -655,11 +596,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return false;
     }
 
-    /**
-     * Tries to (re-)attach the image renderer to an existing map. Returns
-     * true if the map now shows the image (or already did). Uses the int
-     * overload of Bukkit.getMap: the short overload truncates ids > 32767.
-     */
     private boolean tryApplyRenderer(int mapId, byte[] pixels) {
         MapView mapView;
         try {
@@ -679,7 +615,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         return true;
     }
 
-    /** Applies a renderer, retrying while the map data is not loaded yet. */
     private void applyWithRetry(int mapId, byte[] pixels, boolean fromPixels, int attempt) {
         if (tryApplyRenderer(mapId, pixels)) {
             if (fromPixels) {
@@ -705,12 +640,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                 APPLY_RETRY_DELAY_TICKS);
     }
 
-    /**
-     * One-shot migration for a legacy URL/local entry with no saved pixels:
-     * downloads the image, then queues the (serialized, main-thread) pixel
-     * extraction. Download failures are retried; a tile that still fails is
-     * left un-restored and retried on the next restart, never silently lost.
-     */
     private void migrateMapAsync(int mapId, String source, String url, String fileName,
                                  int row, int col, int totalRows, int totalCols, int attempt) {
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
@@ -751,7 +680,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                 if (attempt < MAX_DOWNLOAD_ATTEMPTS) {
                     getLogger().warning("MapImage: failed to download map " + mapId
                             + " (attempt " + attempt + "/" + MAX_DOWNLOAD_ATTEMPTS + "): "
-                            + failure + " -- retrying");
+                            + failure + "; retrying");
                     final int next = attempt + 1;
                     Bukkit.getScheduler().runTaskLater(this,
                             () -> mapQueue.add(() -> migrateMapAsync(mapId, source, url, fileName, row, col, totalRows, totalCols, next)),
@@ -759,30 +688,23 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                 } else {
                     getLogger().warning("MapImage: failed to download map " + mapId + " from " + url
                             + " after " + MAX_DOWNLOAD_ATTEMPTS + " attempts: " + failure
-                            + " -- will retry on the next restart");
+                            + "; will retry on the next restart");
                     finishMap(mapId, false, false);
                 }
                 return;
             }
 
-            // Pixels are extracted on the main thread, serialized through
-            // mapQueue, so concurrent MapPalette.matchColor calls can never
-            // race the color-cache init (cold cache build takes ~39s; the
-            // first call throws IllegalStateException until it is ready).
             final BufferedImage image = original;
             mapQueue.add(() -> extractAndPersistTile(mapId, row, col, totalRows, totalCols, image, 0));
         });
     }
 
-    /** Extracts one tile's pixels (main thread), persists them, then applies. */
     private void extractAndPersistTile(int mapId, int row, int col, int totalRows, int totalCols,
                                        BufferedImage original, int attempt) {
         byte[] pixels;
         try {
             pixels = extractTilePixels(original, row, col, totalRows, totalCols);
         } catch (IllegalStateException e) {
-            // Map color cache still building (cold start). Retry with a delay
-            // instead of dropping the tile.
             if (attempt < MAX_COLOR_CACHE_RETRIES) {
                 if (attempt == 0) {
                     getLogger().info("MapImage: map color cache not ready yet for map " + mapId
@@ -796,7 +718,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
             }
             getLogger().log(Level.SEVERE, "MapImage: map color cache still not ready after "
                     + MAX_COLOR_CACHE_RETRIES + " retries for map " + mapId
-                    + " -- will retry on the next restart", e);
+                    + "; will retry on the next restart", e);
             finishMap(mapId, false, false);
             return;
         } catch (Throwable t) {
@@ -813,7 +735,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         applyWithRetry(mapId, pixels, false, 0);
     }
 
-    /** Terminal accounting for one map in the current restore run. */
     private void finishMap(int mapId, boolean fromPixels, boolean success) {
         Integer run = mapRun.get(mapId);
         if (run == null || run != currentRun) return;
@@ -842,7 +763,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
                 + migratedFromDownload.get() + " migrated (downloaded + pixels saved), "
                 + restoreFailed.get() + " failed"
                 + (pending > 0 ? " (" + pending + " still pending)" : "")
-                + (forced && pending > 0 ? " -- some tiles are still retrying; they will finish or retry on the next restart" : "");
+                + (forced && pending > 0 ? "; some tiles are still retrying and will finish or retry on the next restart" : "");
         getLogger().info(msg);
         Player player = restoreNotifyPlayer;
         if (player != null && player.isOnline()) {
@@ -851,11 +772,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         restoreNotifyPlayer = null;
     }
 
-    /**
-     * Safety net for maps that load after enable (or whose enable-time
-     * restore ran before the map data was loaded): when a known map
-     * initializes, re-attach its saved image renderer.
-     */
     @EventHandler
     public void onMapInitialize(MapInitializeEvent event) {
         MapView view = event.getMap();
@@ -874,7 +790,6 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         getLogger().info("MapImage: re-applied saved image to map " + mapId + " as it initialized");
     }
 
-    /** /mapimage repair: re-run the enable restore now, and report the result. */
     private void runRepair(Player player) {
         beginRestoreRun(player);
         int queued = restoreSavedMaps();
@@ -885,7 +800,7 @@ public class MapImage extends JavaPlugin implements CommandExecutor, Listener {
         }
         player.sendMessage(ChatColor.GREEN + "Repair started for " + queued + " map(s): "
                 + "restoring from saved pixels or re-downloading missing ones. "
-                + "I'll report the result when it finishes.");
+                + "Result is reported when it finishes.");
     }
 
     private byte[] extractTilePixels(BufferedImage original, int row, int col, int totalRows, int totalCols) {

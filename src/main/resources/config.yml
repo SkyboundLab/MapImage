@@ -1,15 +1,15 @@
-# XP levels it costs to create an image map (0 = free)
+# XP levels needed to create an image map (0 = free).
 xp-cost-levels: 5
 
-# Require players to hold an empty map (the vanilla "Map" item) to create an image map.
-# One empty map per tile is consumed when the map is created successfully (2x2 = 4 maps).
+# Require an empty map item to create an image map.
+# One empty map is used per tile (2x2 = 4 maps).
 require-empty-map: true
 
-# Maximum number of maps a single image can use (rows x cols). Default 64 (8x8).
+# Max maps one image can use (rows x cols). 64 = 8x8.
 max-maps: 64
 
-# Seconds a player has to type the image URL in chat after running /mapimage with no
-# arguments (fallback for clients/servers without dialog popup support).
+# Seconds to type the image URL in chat after running /mapimage
+# with no arguments.
 chat-input-timeout-seconds: 30
 
 maps: {}
